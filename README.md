@@ -1,8 +1,7 @@
-# 最小化 DiT-XL/2 扩散缓存实验
+# DiT-XL/2 扩散缓存实验
 
-本目录是一个独立的实验项目，仅包含使用 DiT-XL/2 生成 256×256 ImageNet
-样本并计算 FID 和 Inception Score 所需的代码。项目不会导入上级仓库中
-`condition/` 目录下的任何实现。
+本目录是一个实验项目，用于使用 DiT-XL/2 生成 256×256 ImageNet
+样本并计算 FID 和 Inception Score。
 
 已实现的采样器：
 
@@ -36,7 +35,7 @@ conda create -n dfs-acc python=3.10 -y
 conda activate dfs-acc
 
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-pip install -r dfs_acc_exp/requirements.txt
+pip install -r requirements.txt
 ```
 
 ## 资源文件
@@ -44,35 +43,28 @@ pip install -r dfs_acc_exp/requirements.txt
 在可联网的机器上执行：
 
 ```bash
-bash dfs_acc_exp/download_assets.sh
+bash download_assets.sh
 ```
 
-如果服务器无法联网，请上传完整的 `dfs_acc_exp/assets/` 目录。该目录包含
+如果服务器无法联网，请上传完整的 `assets/` 目录。该目录包含
 Diffusers 格式的 DiT/VAE 流水线、ADM ImageNet-256 参考样本，以及与
 torch-fidelity 兼容的 Inception 权重。
 
 首次使用时，需要将压缩的参考样本转换一次（输出约 10 GB）：
 
 ```bash
-python dfs_acc_exp/prepare_reference.py \
-  --input dfs_acc_exp/assets/VIRTUAL_imagenet256_labeled.npz \
-  --output dfs_acc_exp/assets/imagenet256-reference.npy
+python prepare_reference.py \
+  --input assets/VIRTUAL_imagenet256_labeled.npz \
+  --output assets/imagenet256-reference.npy
 ```
 
 ## 生成 5 万张样本
 
-以下示例使用物理 GPU 4 和 6：
-
 ```bash
-CUDA_VISIBLE_DEVICES=4,6 torchrun --standalone --nproc_per_node=2 \
-  dfs_acc_exp/sample.py \
-  --model-path dfs_acc_exp/assets/DiT-XL-2-256 \
+torchrun --standalone --nproc_per_node=4 \
+  sample.py \
   --sampler pfdiff_3_2 \
   --nfe 50 \
-  --cfg-scale 1.5 \
-  --cfg-channels 3 \
-  --precision fp32 \
-  --num-samples 50000 \
   --batch-size 4 \
   --output-dir dfs_acc_exp/outputs/pfdiff32-reference-nfe50
 ```
@@ -81,15 +73,10 @@ CUDA_VISIBLE_DEVICES=4,6 torchrun --standalone --nproc_per_node=2 \
 网格点；`baseline` 会执行 50 次 DiT 推理，PFDiff-3-2 则执行 13 次：
 
 ```bash
-CUDA_VISIBLE_DEVICES=4,6 torchrun --standalone --nproc_per_node=2 \
-  dfs_acc_exp/sample.py \
-  --model-path dfs_acc_exp/assets/DiT-XL-2-256 \
+torchrun --standalone --nproc_per_node=4 \
+  sample.py \
   --sampler baseline \
   --nfe 50 \
-  --cfg-scale 1.5 \
-  --cfg-channels 3 \
-  --precision fp32 \
-  --num-samples 50000 \
   --batch-size 4 \
   --output-dir dfs_acc_exp/outputs/baseline-reference-nfe50
 ```
@@ -102,11 +89,7 @@ CUDA_VISIBLE_DEVICES=4,6 torchrun --standalone --nproc_per_node=2 \
 ## FID 和 Inception Score
 
 ```bash
-CUDA_VISIBLE_DEVICES=4 python dfs_acc_exp/evaluate.py \
-  --samples dfs_acc_exp/outputs/pfdiff32-reference-nfe50 \
-  --reference dfs_acc_exp/assets/imagenet256-reference.npy \
-  --inception-weights dfs_acc_exp/assets/metrics/weights-inception-2015-12-05-6726825d.pth \
-  --batch-size 64
+python evaluate.py --samples outputs/pfdiff32-reference-nfe50
 ```
 
 计算结果会输出到终端，并保存为样本目录下的 `metrics.json`。该文件只包含：
