@@ -6,4 +6,6 @@ outputs/
 *.npy
 *.npz
 *.bin
+*.output
+*.out
 

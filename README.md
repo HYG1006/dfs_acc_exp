@@ -1,30 +1,35 @@
-# Minimal DiT-XL/2 diffusion-cache experiment
+# 最小化 DiT-XL/2 扩散缓存实验
 
-This standalone directory contains only the code needed to generate 256x256
-ImageNet samples with DiT-XL/2 and report FID plus Inception Score. It does not
-import anything from the parent repository's `condition/` implementations.
+本目录是一个独立的实验项目，仅包含使用 DiT-XL/2 生成 256×256 ImageNet
+样本并计算 FID 和 Inception Score 所需的代码。项目不会导入上级仓库中
+`condition/` 目录下的任何实现。
 
-Implemented samplers:
+已实现的采样器：
 
-- `baseline`: deterministic DDIM, one full DiT evaluation per timestep.
-- `pfdiff_3_2`: a `4*NFE-3` grid, cached prediction, and a full correction at
-  the `t[i-2]` springboard for each four-position jump.
+- `baseline`：确定性 DDIM，每个时间步执行一次完整的 DiT 推理。
+- `pfdiff_3_2`：使用与基准采样器相同的参考网格；每次跨越四个网格位置时，
+  先复用缓存的预测结果，再在 `t[i-2]` 跳板位置执行一次完整推理进行校正。
 
-## Layout
+`--nfe` 始终表示基准 DDIM 的参考 NFE，也就是两种方法共用的时间步网格长度，
+而不是缓存采样器实际调用模型的次数。例如，设置 `--nfe 50` 时，`baseline`
+会执行 50 次 DiT 推理，而 `pfdiff_3_2` 仅执行 13 次；两者使用相同的 50 点
+DDIM 网格。
+
+## 目录结构
 
 ```text
-diffusion.py             shared DDIM schedule and transition math
-dit.py                   DiT, CFG, and VAE adapter
-sample.py                distributed generation backbone
-prepare_reference.py     streaming NPZ -> disk-backed NPY conversion
-evaluate.py              FID and Inception Score only
-samplers/                auto-discovered sampling methods
+diffusion.py             共用的 DDIM 调度与状态转移计算
+dit.py                   DiT、CFG 和 VAE 适配器
+sample.py                分布式样本生成主程序
+prepare_reference.py     将流式读取的 NPZ 转换为磁盘映射 NPY
+evaluate.py              仅计算 FID 和 Inception Score
+samplers/                自动发现的采样方法
 ```
 
-## Environment
+## 环境配置
 
-Use Python 3.10/3.11. Install PyTorch from the CUDA index compatible with the
-server driver. For a CUDA 12.8 driver:
+请使用 Python 3.10/3.11，并根据服务器驱动支持的 CUDA 版本安装 PyTorch。
+对于 CUDA 12.8 驱动，可执行：
 
 ```bash
 conda create -n dfs-acc python=3.10 -y
@@ -34,19 +39,19 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 pip install -r dfs_acc_exp/requirements.txt
 ```
 
-## Assets
+## 资源文件
 
-On an internet-connected machine:
+在可联网的机器上执行：
 
 ```bash
 bash dfs_acc_exp/download_assets.sh
 ```
 
-For an offline server, upload the complete `dfs_acc_exp/assets/` directory.
-It contains the Diffusers DiT/VAE pipeline, the ADM ImageNet-256 reference
-batch, and torch-fidelity's compatible Inception weights.
+如果服务器无法联网，请上传完整的 `dfs_acc_exp/assets/` 目录。该目录包含
+Diffusers 格式的 DiT/VAE 流水线、ADM ImageNet-256 参考样本，以及与
+torch-fidelity 兼容的 Inception 权重。
 
-Convert the compressed reference batch once (about 10 GB output):
+首次使用时，需要将压缩的参考样本转换一次（输出约 10 GB）：
 
 ```bash
 python dfs_acc_exp/prepare_reference.py \
@@ -54,83 +59,57 @@ python dfs_acc_exp/prepare_reference.py \
   --output dfs_acc_exp/assets/imagenet256-reference.npy
 ```
 
-## Smoke tests
+## 生成 5 万张样本
 
-Baseline, one GPU:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 \
-  dfs_acc_exp/sample.py \
-  --model-path dfs_acc_exp/assets/DiT-XL-2-256 \
-  --sampler baseline \
-  --nfe 4 \
-  --num-samples 64 \
-  --batch-size 4 \
-  --output-dir dfs_acc_exp/outputs/smoke-baseline
-```
-
-PFDiff-3-2:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 \
-  dfs_acc_exp/sample.py \
-  --model-path dfs_acc_exp/assets/DiT-XL-2-256 \
-  --sampler pfdiff_3_2 \
-  --nfe 4 \
-  --num-samples 64 \
-  --batch-size 4 \
-  --output-dir dfs_acc_exp/outputs/smoke-pfdiff32
-```
-
-## 50K sampling
-
-Example with physical GPUs 4 and 6:
+以下示例使用物理 GPU 4 和 6：
 
 ```bash
 CUDA_VISIBLE_DEVICES=4,6 torchrun --standalone --nproc_per_node=2 \
   dfs_acc_exp/sample.py \
   --model-path dfs_acc_exp/assets/DiT-XL-2-256 \
   --sampler pfdiff_3_2 \
-  --nfe 4 \
+  --nfe 50 \
   --cfg-scale 1.5 \
   --cfg-channels 3 \
   --precision fp32 \
   --num-samples 50000 \
   --batch-size 4 \
-  --output-dir dfs_acc_exp/outputs/pfdiff32-nfe4
+  --output-dir dfs_acc_exp/outputs/pfdiff32-reference-nfe50
 ```
 
-The same-NFE baseline changes only two arguments:
+要运行参考 NFE 相同的基准实验，只需修改两个参数。两种方法均使用 50 个
+网格点；`baseline` 会执行 50 次 DiT 推理，PFDiff-3-2 则执行 13 次：
 
 ```bash
 CUDA_VISIBLE_DEVICES=4,6 torchrun --standalone --nproc_per_node=2 \
   dfs_acc_exp/sample.py \
   --model-path dfs_acc_exp/assets/DiT-XL-2-256 \
   --sampler baseline \
-  --nfe 4 \
+  --nfe 50 \
   --cfg-scale 1.5 \
   --cfg-channels 3 \
   --precision fp32 \
   --num-samples 50000 \
   --batch-size 4 \
-  --output-dir dfs_acc_exp/outputs/baseline-nfe4
+  --output-dir dfs_acc_exp/outputs/baseline-reference-nfe50
 ```
 
-Each output directory contains disk-backed `rank-*.npy` shards and one
-`metadata.json`. No 10 GB in-memory concatenation is performed.
+每个输出目录都包含磁盘映射的 `rank-*.npy` 分片和一个 `metadata.json` 文件。
+元数据中的 `reference_nfe` 记录命令行参数值，`actual_nfe` 和
+`dit_evaluations_per_sample` 记录实际模型调用次数。程序不会在内存中拼接出
+一个 10 GB 的数组。
 
-## FID and Inception Score
+## FID 和 Inception Score
 
 ```bash
 CUDA_VISIBLE_DEVICES=4 python dfs_acc_exp/evaluate.py \
-  --samples dfs_acc_exp/outputs/pfdiff32-nfe4 \
+  --samples dfs_acc_exp/outputs/pfdiff32-reference-nfe50 \
   --reference dfs_acc_exp/assets/imagenet256-reference.npy \
   --inception-weights dfs_acc_exp/assets/metrics/weights-inception-2015-12-05-6726825d.pth \
   --batch-size 64
 ```
 
-The result is printed and saved as `metrics.json` in the sample directory. It
-contains only:
+计算结果会输出到终端，并保存为样本目录下的 `metrics.json`。该文件只包含：
 
 ```text
 frechet_inception_distance
@@ -138,9 +117,9 @@ inception_score_mean
 inception_score_std
 ```
 
-## Adding a sampling method
+## 添加采样方法
 
-Add one file such as `samplers/my_cache.py`:
+新增一个文件，例如 `samplers/my_cache.py`：
 
 ```python
 from .base import Sampler, register_sampler
@@ -148,15 +127,13 @@ from .base import Sampler, register_sampler
 @register_sampler("my_cache")
 class MyCacheSampler(Sampler):
     @property
-    def grid_steps(self):
-        return self.nfe
+    def model_evaluations(self):
+        return ...
 
     def sample(self, noise, schedule, predict_x0):
-        # Use predict_x0(x, short_t) only when a full DiT evaluation is needed.
+        # 仅在需要执行完整 DiT 推理时调用 predict_x0(x, short_t)。
         ...
 ```
 
-The module is discovered automatically. `sample.py` does not need to change.
-Sampler-specific CLI flags can be declared by overriding `add_arguments()` and
-consumed in `from_args()`.
-
+程序会自动发现该模块，无需修改 `sample.py`。如需声明采样器专用的命令行
+参数，可重写 `add_arguments()`，并在 `from_args()` 中读取这些参数。
