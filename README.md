@@ -46,7 +46,7 @@ conda create -n dfs-acc python=3.10 -y
 conda activate dfs-acc
 
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-pip install -r dfs_acc_exp/requirements.txt
+pip install -r requirements.txt
 ```
 
 ## 资源文件
@@ -54,19 +54,19 @@ pip install -r dfs_acc_exp/requirements.txt
 在可联网的机器上执行：
 
 ```bash
-bash dfs_acc_exp/download_assets.sh
+bash download_assets.sh
 ```
 
-如果服务器无法联网，请上传完整的 `dfs_acc_exp/assets/` 目录。该目录包含
+如果服务器无法联网，请上传完整的 `assets/` 目录。该目录包含
 Diffusers 格式的 DiT/VAE 流水线、ADM ImageNet-256 参考样本，以及与
 torch-fidelity 兼容的 Inception 权重。
 
 首次使用时，需要将压缩的参考样本转换一次（输出约 10 GB）：
 
 ```bash
-python dfs_acc_exp/prepare_reference.py \
-  --input dfs_acc_exp/assets/VIRTUAL_imagenet256_labeled.npz \
-  --output dfs_acc_exp/assets/imagenet256-reference.npy
+python prepare_reference.py \
+  --input assets/VIRTUAL_imagenet256_labeled.npz \
+  --output assets/imagenet256-reference.npy
 ```
 
 ## 生成 5 万张样本
@@ -75,8 +75,8 @@ python dfs_acc_exp/prepare_reference.py \
 
 ```bash
 CUDA_VISIBLE_DEVICES=4,6 torchrun --standalone --nproc_per_node=2 \
-  dfs_acc_exp/sample.py \
-  --model-path dfs_acc_exp/assets/DiT-XL-2-256 \
+  sample.py \
+  --model-path assets/DiT-XL-2-256 \
   --sampler pfdiff_3_2 \
   --nfe 50 \
   --cfg-scale 1.5 \
@@ -84,7 +84,7 @@ CUDA_VISIBLE_DEVICES=4,6 torchrun --standalone --nproc_per_node=2 \
   --precision fp32 \
   --num-samples 50000 \
   --batch-size 4 \
-  --output-dir dfs_acc_exp/outputs/pfdiff32-reference-nfe50
+  --output-dir outputs/pfdiff32-reference-nfe50
 ```
 
 ## TaylorSeer cache 粒度
@@ -128,8 +128,8 @@ python sample.py --sampler pfdiff_3_2 --nfe 50 \
 
 ```bash
 CUDA_VISIBLE_DEVICES=4,6 torchrun --standalone --nproc_per_node=2 \
-  dfs_acc_exp/sample.py \
-  --model-path dfs_acc_exp/assets/DiT-XL-2-256 \
+  sample.py \
+  --model-path assets/DiT-XL-2-256 \
   --sampler baseline \
   --nfe 50 \
   --cfg-scale 1.5 \
@@ -137,7 +137,7 @@ CUDA_VISIBLE_DEVICES=4,6 torchrun --standalone --nproc_per_node=2 \
   --precision fp32 \
   --num-samples 50000 \
   --batch-size 4 \
-  --output-dir dfs_acc_exp/outputs/baseline-reference-nfe50
+  --output-dir outputs/baseline-reference-nfe50
 ```
 
 每个输出目录都包含磁盘映射的 `rank-*.npy` 分片和一个 `metadata.json` 文件。
@@ -148,10 +148,10 @@ CUDA_VISIBLE_DEVICES=4,6 torchrun --standalone --nproc_per_node=2 \
 ## FID 和 Inception Score
 
 ```bash
-CUDA_VISIBLE_DEVICES=4 python dfs_acc_exp/evaluate.py \
-  --samples dfs_acc_exp/outputs/pfdiff32-reference-nfe50 \
-  --reference dfs_acc_exp/assets/imagenet256-reference.npy \
-  --inception-weights dfs_acc_exp/assets/metrics/weights-inception-2015-12-05-6726825d.pth \
+CUDA_VISIBLE_DEVICES=4 python evaluate.py \
+  --samples outputs/pfdiff32-reference-nfe50 \
+  --reference assets/imagenet256-reference.npy \
+  --inception-weights assets/metrics/weights-inception-2015-12-05-6726825d.pth \
   --batch-size 64
 ```
 
