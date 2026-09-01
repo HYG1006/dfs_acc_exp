@@ -1,24 +1,24 @@
-"""TaylorSeer output forecasting on the shared baseline DDIM grid.
-
-The paper forecasts internal DiT attention/MLP features.  This repository
-deliberately exposes the denoiser only through ``predict_x0``, so the sampler
-applies the same finite-difference Taylor rule to the observable, CFG-guided
-epsilon output.  No DiT backend is bypassed and every full activation is one
-``predict_x0`` call.
-"""
-
-import math
+"""TaylorSeer forecasting on the shared baseline DDIM grid."""
 
 import torch
+
+from cache import CacheGranularity, CacheRequest, TaylorFeatureCache
 
 from .base import Sampler, register_sampler
 
 
 @register_sampler("taylorseer")
 class TaylorSeerSampler(Sampler):
-    """Fixed-interval TaylorSeer with an output-level epsilon cache."""
+    """Fixed-interval TaylorSeer with selectable cache boundaries."""
 
-    def __init__(self, nfe: int, interval: int = 4, order: int = 4):
+    def __init__(
+        self,
+        nfe: int,
+        interval: int = 4,
+        order: int = 4,
+        cache_granularity: str = "full",
+        cache_debug: bool = False,
+    ):
         super().__init__(nfe)
         if interval < 1:
             raise ValueError("TaylorSeer interval N must be at least 1")
@@ -26,6 +26,9 @@ class TaylorSeerSampler(Sampler):
             raise ValueError("TaylorSeer order O must be non-negative")
         self.interval = interval
         self.order = order
+        self.cache_granularity = CacheGranularity.parse(cache_granularity)
+        self.cache_debug = cache_debug
+        self.cache_debug_stats = {}
 
     @classmethod
     def add_arguments(cls, parser):
@@ -47,6 +50,17 @@ class TaylorSeerSampler(Sampler):
             metavar="O",
             help="TaylorSeer expansion order (default: 4)",
         )
+        parser.add_argument(
+            "--cache-granularity",
+            choices=[item.value for item in CacheGranularity],
+            default=CacheGranularity.FULL.value,
+            help="cache boundary: guided output, CRF, or per-layer branches (default: full)",
+        )
+        parser.add_argument(
+            "--cache-debug",
+            action="store_true",
+            help="report cache target counts, memory, and executed/bypassed branches",
+        )
 
     @classmethod
     def from_args(cls, args):
@@ -54,6 +68,8 @@ class TaylorSeerSampler(Sampler):
             nfe=args.nfe,
             interval=args.taylorseer_interval,
             order=args.taylorseer_order,
+            cache_granularity=args.cache_granularity,
+            cache_debug=args.cache_debug,
         )
 
     @property
@@ -79,66 +95,47 @@ class TaylorSeerSampler(Sampler):
         )
         return (x.float() - torch.sqrt(alpha) * pred_x0.float()) / torch.sqrt(1.0 - alpha)
 
-    def _update_factors(self, factors, feature, distance):
-        """Update recursive finite differences at a full activation.
-
-        This is Eq. (7) in the paper applied recursively, with ``distance``
-        measured in respaced DDIM indices rather than original 0...999 model
-        timesteps.  Missing history naturally limits the available order.
-        """
-        updated = [feature]
-        if factors is not None:
-            for derivative_order in range(min(self.order, len(factors))):
-                updated.append(
-                    (updated[derivative_order] - factors[derivative_order]) / distance
-                )
-        return updated
-
-    @staticmethod
-    def _forecast(factors, distance):
-        """Evaluate the paper's finite-difference Taylor formula (Eq. 10)."""
-        prediction = factors[0]
-        power = 1
-        for derivative_order in range(1, len(factors)):
-            power *= distance
-            prediction = prediction + (
-                factors[derivative_order] * (power / math.factorial(derivative_order))
-            )
-        return prediction
-
     @torch.inference_mode()
     def sample(self, noise, schedule, predict_x0):
         if len(schedule) != self.grid_steps:
             raise ValueError("TaylorSeer must use the baseline reference grid")
 
         x = noise
-        factors = None
-        last_activation = None
+        # This state is trajectory-local, so Full cache history cannot leak to
+        # a later sample batch. Internal histories are reset by sample.py at
+        # the same trajectory boundary.
+        full_cache = TaylorFeatureCache(self.order)
         evaluations = 0
+        cache_hits = 0
 
-        # The traversal remains on every shared DDIM node.  Only the denoiser
-        # output is forecast at cache nodes; DDIM transitions are never
-        # respaced or replaced by a different grid.
+        # The traversal remains on every shared DDIM node. Only the selected
+        # feature target is forecast; DDIM transitions are never respaced or
+        # replaced by a different grid.
         for short_t in reversed(range(len(schedule))):
-            if self._is_full_activation(short_t, len(schedule)):
-                full_pred_x0 = predict_x0(x, short_t)
-                epsilon = self._epsilon_from_x0(x, short_t, full_pred_x0, schedule)
-                if last_activation is None:
-                    factors = [epsilon]
+            refresh = self._is_full_activation(short_t, len(schedule))
+            if refresh:
+                request = CacheRequest(self.cache_granularity, short_t, refresh=True)
+                if self.cache_granularity is CacheGranularity.FULL:
+                    # Keep the legacy two-argument call and cache location: the
+                    # CFG-guided epsilon returned by DiTBackend.
+                    full_pred_x0 = predict_x0(x, short_t)
                 else:
-                    factors = self._update_factors(
-                        factors,
-                        epsilon,
-                        short_t - last_activation,
-                    )
-                last_activation = short_t
+                    full_pred_x0 = predict_x0(x, short_t, request)
+                epsilon = self._epsilon_from_x0(x, short_t, full_pred_x0, schedule)
+                if self.cache_granularity is CacheGranularity.FULL:
+                    full_cache.activate(epsilon, short_t)
                 pred_x0 = full_pred_x0
                 evaluations += 1
             else:
-                # At reference node t-k, Eq. (10) uses the signed grid-index
-                # displacement from the most recent fully activated node t.
-                epsilon = self._forecast(factors, short_t - last_activation)
-                pred_x0 = schedule.predict_x0(x, short_t, epsilon)
+                cache_hits += 1
+                if self.cache_granularity is CacheGranularity.FULL:
+                    # At reference node t-k, Eq. (10) uses the signed grid-
+                    # index displacement from the latest activated node t.
+                    epsilon = full_cache.predict(short_t)
+                    pred_x0 = schedule.predict_x0(x, short_t, epsilon)
+                else:
+                    request = CacheRequest(self.cache_granularity, short_t, refresh=False)
+                    pred_x0 = predict_x0(x, short_t, request)
 
             x = schedule.ddim_step(x, short_t, short_t - 1, pred_x0)
 
@@ -147,4 +144,22 @@ class TaylorSeerSampler(Sampler):
                 "invalid TaylorSeer traversal: "
                 f"evaluations={evaluations}, expected={self.model_evaluations}"
             )
+        self.cache_debug_stats = {
+            "cache_granularity": self.cache_granularity.value,
+            "number_of_cache_targets": (
+                1 if self.cache_granularity is CacheGranularity.FULL else None
+            ),
+            "history_length": (
+                len(full_cache.factors)
+                if self.cache_granularity is CacheGranularity.FULL
+                else None
+            ),
+            "approx_cache_memory_MB": (
+                full_cache.memory_bytes / (1024**2)
+                if self.cache_granularity is CacheGranularity.FULL
+                else None
+            ),
+            "full_backbone_forward_count": evaluations,
+            "cache_hit_count": cache_hits,
+        }
         return x

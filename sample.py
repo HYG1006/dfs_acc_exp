@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Distributed ImageNet-256 sampling with a pluggable diffusion sampler."""
+"""使用可插拔 diffusion sampler 进行分布式 ImageNet-256 样本生成。"""
 
 import argparse
 import json
@@ -20,6 +20,14 @@ from samplers import sampler_class, sampler_names
 
 
 def distributed_setup():
+    """读取分布式环境变量并初始化当前进程的 CUDA/NCCL 环境。
+
+    参数:
+        无。函数读取 ``WORLD_SIZE``、``RANK`` 和 ``LOCAL_RANK`` 环境变量。
+    返回:
+        四元组 ``(distributed, rank, world_size, device)``：是否分布式、当前全局
+        rank、总进程数，以及当前进程绑定的 ``torch.device('cuda', local_rank)``。
+    """
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     distributed = world_size > 1
     rank = int(os.environ.get("RANK", "0"))
@@ -39,12 +47,28 @@ def distributed_setup():
 
 
 def barrier(enabled):
+    """按需执行一次分布式进程同步屏障。
+
+    参数:
+        enabled: 是否已启用分布式运行；为真时调用 ``dist.barrier``。
+    返回:
+        无。
+    """
     if enabled:
         dist.barrier()
 
 
 def prepare_output_directory(output_dir, overwrite, distributed, rank):
-    """Let rank 0 exclusively validate/create output, then notify all ranks."""
+    """由 rank 0 独占校验并创建输出目录，再把错误同步给其他 rank。
+
+    参数:
+        output_dir: 目标 ``Path``；保存 NPY 分片、metadata 和预览图。
+        overwrite: 目录已存在时是否删除并重建。
+        distributed: 是否启用分布式进程组。
+        rank: 当前进程的全局 rank。
+    返回:
+        无。成功时确保目录存在；失败时所有 rank 都抛出一致的异常。
+    """
     error = None
     if rank == 0:
         try:
@@ -53,7 +77,7 @@ def prepare_output_directory(output_dir, overwrite, distributed, rank):
                     raise FileExistsError(f"output exists: {output_dir}; pass --overwrite")
                 shutil.rmtree(output_dir)
             output_dir.mkdir(parents=True)
-        except Exception as exc:  # propagate rank-0 filesystem failures cleanly
+        except Exception as exc:  # 将 rank 0 的文件系统错误完整传递给所有进程。
             error = f"{type(exc).__name__}: {exc}"
 
     if distributed:
@@ -66,6 +90,13 @@ def prepare_output_directory(output_dir, overwrite, distributed, rank):
 
 
 def build_parser():
+    """构造基础参数和所选 sampler 专属参数组成的命令行解析器。
+
+    参数:
+        无。函数先预解析当前命令行中的 ``--sampler``。
+    返回:
+        ``argparse.ArgumentParser``，包含通用采样参数及所选 sampler 的参数。
+    """
     bootstrap = argparse.ArgumentParser(add_help=False)
     bootstrap.add_argument("--sampler", choices=sampler_names(), default="baseline")
     known, _ = bootstrap.parse_known_args()
@@ -96,6 +127,15 @@ def build_parser():
 
 
 def main(args):
+    """执行完整的分布式采样、VAE 解码、分片保存和 metadata 汇总流程。
+
+    参数:
+        args: ``build_parser`` 产生的命令行命名空间，包含模型路径、reference NFE、
+            batch 大小、样本数、CFG、精度、随机种子和输出目录等设置。
+    返回:
+        无。每个 rank 写出形状为 ``[per_rank,256,256,3]`` 的 uint8 NPY 分片；
+        rank 0 额外写出 metadata JSON 和预览 PNG。
+    """
     distributed, rank, world_size, device = distributed_setup()
     if args.num_samples < 1 or args.batch_size < 1 or args.vae_batch_size < 1:
         raise ValueError("sample and batch counts must be positive")
@@ -111,8 +151,7 @@ def main(args):
     prepare_output_directory(output_dir, args.overwrite, distributed, rank)
 
     sampler = sampler_class(args.sampler).from_args(args)
-    # The CLI NFE always defines the baseline reference grid. Samplers may
-    # reduce model calls, but they never silently change this shared schedule.
+    # 命令行 NFE 始终定义 baseline 参考网格；sampler 可减少模型调用但不能改换该日程。
     schedule = DiffusionSchedule.for_ddim(args.nfe)
     backend = DiTBackend(args.model_path, device, args.precision, args.local_files_only)
 
@@ -128,23 +167,52 @@ def main(args):
     )
 
     if rank == 0:
+        cache_description = ""
+        if hasattr(sampler, "cache_granularity"):
+            cache_description = f", cache_granularity={sampler.cache_granularity.value}"
         print(
             f"sampler={args.sampler}, reference_NFE={args.nfe}, grid={len(schedule)}, "
             f"DiT_evaluations={sampler.model_evaluations}, "
             f"samples={args.num_samples}, GPUs={world_size}, CFG={args.cfg_scale}"
+            f"{cache_description}"
         )
     iterator = tqdm(range(iterations), desc="sampling rank 0") if rank == 0 else range(iterations)
     offset = 0
-    for _ in iterator:
+    last_cache_stats = None
+    for iteration in iterator:
         noise = torch.randn(args.batch_size, 4, 32, 32, device=device)
         labels = torch.randint(0, 1000, (args.batch_size,), device=device)
         model_evaluations = 0
 
-        def predict_x0(x, short_t):
+        if hasattr(sampler, "cache_granularity"):
+            # 在每个 batch 的新轨迹边界重置 backend；Full 张量 history 保留在 sampler 内。
+            cache_order = getattr(sampler, "cache_order", getattr(sampler, "order", 0))
+            backend.reset_cache(sampler.cache_granularity, cache_order)
+
+        def predict_x0(x, short_t, cache_request=None):
+            """把 sampler 的短时间步请求转换为模型预测的 x0。
+
+            参数:
+                x: 当前 latent 状态，形状为 ``[B,4,32,32]``。
+                short_t: 当前 respaced DDIM 网格索引。
+                cache_request: 可选 ``CacheRequest``；``None`` 或 ``refresh=True``
+                    计作一次完整 DiT evaluation，``refresh=False`` 走内部缓存命中。
+            返回:
+                ``float32`` 的 ``pred_x0`` 张量，形状与 ``x`` 相同，即
+                ``[B,4,32,32]``。
+            """
             nonlocal model_evaluations
-            model_evaluations += 1
+            if cache_request is None or cache_request.refresh:
+                model_evaluations += 1
             model_t = schedule.original_timestep(short_t, len(x), x.device)
-            eps = backend.epsilon(x, model_t, labels, args.cfg_scale, args.cfg_channels)
+            eps = backend.epsilon(
+                x,
+                model_t,
+                labels,
+                args.cfg_scale,
+                args.cfg_channels,
+                cache_request=cache_request,
+            )
             return schedule.predict_x0(x, short_t, eps)
 
         latents = sampler.sample(noise, schedule, predict_x0)
@@ -153,6 +221,13 @@ def main(args):
                 f"sampler reported {sampler.model_evaluations} DiT evaluations "
                 f"but executed {model_evaluations}"
             )
+        if getattr(sampler, "cache_debug", False):
+            if sampler.cache_granularity.value == "full":
+                last_cache_stats = sampler.cache_debug_stats
+            else:
+                last_cache_stats = backend.cache_debug_stats()
+            if rank == 0 and iteration == 0:
+                print("cache_debug=" + json.dumps(last_cache_stats, sort_keys=True))
         images = backend.decode(latents, args.vae_batch_size)
         shard[offset : offset + args.batch_size] = images
         offset += args.batch_size
@@ -179,6 +254,16 @@ def main(args):
             "model_path": args.model_path,
             "model_timesteps": list(schedule.model_timesteps),
         }
+        if hasattr(sampler, "cache_granularity"):
+            metadata["cache_granularity"] = sampler.cache_granularity.value
+            metadata["cache_interval"] = getattr(sampler, "interval", None)
+            metadata["cache_predictor_order"] = getattr(
+                sampler,
+                "cache_order",
+                getattr(sampler, "order", 0),
+            )
+            if last_cache_stats is not None:
+                metadata["cache_debug"] = last_cache_stats
         (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
         first = np.load(output_dir / "rank-00000.npy", mmap_mode="r")
         preview_dir = output_dir / "preview"

@@ -12,7 +12,9 @@ import torch
 from diffusion import DiffusionSchedule
 
 
-PredictX0 = Callable[[torch.Tensor, int], torch.Tensor]
+# Cache-aware samplers may pass a third CacheRequest argument. Existing
+# samplers and external two-argument callbacks remain source-compatible.
+PredictX0 = Callable[..., torch.Tensor]
 _REGISTRY = {}
 
 
